@@ -652,9 +652,41 @@ write_hosts_block() {
   dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null
   ok "Пропинено в $HOSTS:"
   sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | sed '1d;$d' | sed 's/^/    /'
+  ensure_pin_routes
+}
+
+# --- host-routes мимо VPN-туннеля: запиненные IP должны выходить через RU-линк.
+# Иначе при включённом VPN трафик на них уходит в туннель, Google видит egress
+# VPN-сервера и режет по локации (серверная 400, которую патч не снимает).
+phys_gw() {
+  netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF !~ /^(utun|ipsec|ppp|tun|tap)/ {print $2; exit}'
+}
+
+ensure_pin_routes() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  if ! route -n get -inet default 2>/dev/null | grep -q "interface: utun"; then
+    drop_pin_routes   # VPN выключен — /32 не нужны, а протухшие могут чёрнодырить
+    return 0
+  fi
+  local gw; gw=$(phys_gw); [ -z "$gw" ] && return 0
+  local ip n=0
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+    route -n delete -host "$ip" >/dev/null 2>&1
+    route -n add -host "$ip" "$gw" >/dev/null 2>&1 && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && info "VPN активен: $n маршрут(ов) на прокси-IP прописаны мимо туннеля (via $gw)"
+}
+
+drop_pin_routes() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  local ip
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+    route -n delete -host "$ip" >/dev/null 2>&1
+  done
 }
 
 remove_hosts_block() {
+  drop_pin_routes
   if grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
     sed "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/d" "$HOSTS" > "$HOSTS.ag_tmp" && mv "$HOSTS.ag_tmp" "$HOSTS"
     dscacheutil -flushcache 2>/dev/null; killall -HUP mDNSResponder 2>/dev/null
@@ -756,6 +788,7 @@ watch_loop() {
           [ "$alive" = "0" ] && need=1
         done
         [ "$need" = "1" ] && { echo "$(date '+%F %T') пин протух — рефреш" >> "$WATCH_LOG"; dns_pin >> "$WATCH_LOG" 2>&1; }
+        ensure_pin_routes 2>/dev/null
       else
         echo "$(date '+%F %T') hosts недоступен на запись из watchdog — рефреш вручную (пункт 3)" >> "$WATCH_LOG"
       fi

@@ -617,9 +617,38 @@ write_hosts_block() {
   [ -x /usr/sbin/nscd ] && nscd -i hosts 2>/dev/null
   ok "Пропинено в $HOSTS:"
   sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | sed '1d;$d' | sed 's/^/    /'
+  ensure_pin_routes
+}
+
+# --- host-routes мимо VPN-туннеля (см. mac-версию; серверная 400 по egress VPN)
+phys_gw() {
+  ip route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap)' | head -1 | awk '{print $3}'
+}
+
+ensure_pin_routes() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  if ! ip route show default 2>/dev/null | grep -qE 'dev (tun|wg|tap)'; then
+    drop_pin_routes   # VPN выключен — /32 не нужны, а протухшие могут чёрнодырить
+    return 0
+  fi
+  local gw dev; gw=$(phys_gw); dev=$(phys_iface); [ -z "$gw" ] || [ -z "$dev" ] && return 0
+  local ip n=0
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+    ip route replace "$ip/32" via "$gw" dev "$dev" 2>/dev/null && n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && info "VPN активен: $n маршрут(ов) на прокси-IP прописаны мимо туннеля (via $gw)"
+}
+
+drop_pin_routes() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  local ip
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+    ip route del "$ip/32" 2>/dev/null
+  done
 }
 
 remove_hosts_block() {
+  drop_pin_routes
   if grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
     sed "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/d" "$HOSTS" > "$HOSTS.ag_tmp" && mv "$HOSTS.ag_tmp" "$HOSTS"
     systemctl is-active systemd-resolved >/dev/null 2>&1 && resolvectl flush-caches 2>/dev/null
@@ -712,6 +741,7 @@ watch_loop() {
           [ "$alive" = "0" ] && need=1
         done
         [ "$need" = "1" ] && { echo "$(date '+%F %T') пин протух — рефреш" >> "$WATCH_LOG"; dns_pin >> "$WATCH_LOG" 2>&1; }
+        ensure_pin_routes 2>/dev/null
       else
         echo "$(date '+%F %T') hosts недоступен на запись из watchdog — рефреш вручную (пункт 3)" >> "$WATCH_LOG"
       fi
