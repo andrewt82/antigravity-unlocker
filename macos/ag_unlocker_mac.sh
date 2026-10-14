@@ -83,12 +83,31 @@ err()  { say "${C_ERR}[X]${C_N} $1"; }
 info() { say "${C_INFO}[i]${C_N} $1"; }
 
 # ---------------------------------------------------------------- sudo gate
+AUTO_MODE=""
+AUTO_CLI=""
+AUTO_APPS=()
+if [ $# -gt 0 ] && [ "$1" != --watch ]; then
+  case "$1" in
+    --check|--ensure-patched) AUTO_MODE="$1"; shift ;;
+    *) err "Неизвестный режим: $1"; exit 2 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cli-path|--app)
+        [ $# -ge 2 ] && [[ "$2" = /* ]] || { err "Нужен абсолютный путь после $1"; exit 2; }
+        if [ "$1" = --cli-path ]; then AUTO_CLI="$2"; else AUTO_APPS+=("$2"); fi
+        shift 2 ;;
+      *) err "Неизвестный аргумент: $1"; exit 2 ;;
+    esac
+  done
+  [ -n "$AUTO_CLI" ] || { err "Нужен --cli-path /path/to/agy"; exit 2; }
+fi
 # --watch: фоновый режим watchdog (из LaunchAgent) — без меню и без sudo
 if [ "$1" = "--watch" ]; then
   AG_NO_ELEVATE=1
 fi
 # AG_NO_ELEVATE=1 — dev/CI-режим: не поднимать права (таргеты должны быть доступны на запись)
-if [ "$(id -u)" -ne 0 ] && [ -z "$AG_NO_ELEVATE" ]; then
+if [ -z "$AUTO_MODE" ] && [ "$(id -u)" -ne 0 ] && [ -z "$AG_NO_ELEVATE" ]; then
   info "Нужны права администратора (патч бинарей в /Applications + запись /etc/hosts). Перезапуск через sudo..."
   exec sudo bash "$0" "$@"
 fi
@@ -351,7 +370,7 @@ if ($mode eq 'bpatch') {
     exit 0;
 }
 my $content = slurp($file);
-if ($mode eq 'main') {
+if ($mode eq 'main' || $mode eq 'check-main') {
     if (index($content, '/*[AG_PATCHED]*/') >= 0 || index($content, '[AG_PROXY_HOOK]') >= 0) {
         print STDERR "старая версия патча — нужна чистая переустановка IDE\n";
         exit 3;
@@ -362,6 +381,7 @@ if ($mode eq 'main') {
         print STDERR "сигнатура не найдена\n";
         exit 4;
     }
+    exit 10 if $mode eq 'check-main';
     my ($fname, $t, $send, $y, $i, $func, $f, $h) = ($1, $2, $3, $4, $8, $9, $10, $11);
     my $payload = <<"EOP";
 async $fname($t){
@@ -388,13 +408,14 @@ EOP
     print "PATCHED\n";
     exit 0;
 }
-if ($mode eq 'ext') {
+if ($mode eq 'ext' || $mode eq 'check-ext') {
     exit 2 if index($content, '/*[AG_EXT_PATCHED]*/') >= 0;
     my $re = qr/const t=await ([A-Za-z_\$][A-Za-z_\$0-9.]*)\.UserStatus\.getUserStatus\(\);if\(!t\)return\[\];const n=\(0,([A-Za-z_\$][A-Za-z_\$0-9.]*)\)\(t,([A-Za-z_\$][A-Za-z_\$0-9.]*)\),\{email:([A-Za-z_\$][A-Za-z_\$0-9]*),name:([A-Za-z_\$][A-Za-z_\$0-9]*)\}=n;return""===([A-Za-z_\$][A-Za-z_\$0-9]*)\?\[\]:/;
     unless ($content =~ /$re/) {
         print STDERR "сигнатура extension.js не найдена\n";
         exit 4;
     }
+    exit 10 if $mode eq 'check-ext';
     my ($ns, $p2, $dz7, $email, $name) = ($1, $2, $3, $4, $5);
     my $rep = "const t=await $ns.UserStatus.getUserStatus();let $email=\"\",$name=\"\";try{if(t){const n=(0,$p2)(t,$dz7);$email=n.email||\"\";$name=n.name||\"\";}}catch(_){}if($email===\"\"){$email=\"antigravity-user\";$name=\"User\";}return false?[]:";
     $content = substr($content, 0, $-[0]) . $rep . substr($content, $+[0]);
@@ -867,10 +888,163 @@ show_status() {
   fi
 }
 
+# ---------------------------------------------------------------- automatic patch (no menu, DNS, or process termination)
+# Read the embedded Perl program directly: --check creates no temporary files.
+check_js() {
+  local rc
+  sed -n "/^  cat > .*<<'PERLEOF'$/,/^PERLEOF$/p" "$0" | sed '1d;$d' |
+    perl - "check-$1" "$2"
+  rc=$?
+  [ "$rc" -eq 2 ] && return 0
+  return "$rc"
+}
+
+check_binary() {
+  local counts original patched
+  [ -r "$1" ] && [ -x "$1" ] && file "$1" | grep -q 'Mach-O' || {
+    err "Не найден читаемый исполняемый Mach-O: $1"; return 1;
+  }
+  counts=$(perl -0777 -ne 'my $a=()=/ineligible/g; my $b=()=/inexigible/g; print "$a $b"' "$1") || return 1
+  read -r original patched <<< "$counts"
+  [ "$original" -gt 0 ] && return 10
+  [ "$patched" -gt 0 ] || { err "Неизвестная сборка (нет сигнатуры патча): $1"; return 1; }
+  codesign --verify "$1" 2>/dev/null || return 10
+  return 0
+}
+
+auto_check() {
+  PENDING_BINARIES=(); PENDING_APPS=(); PENDING_JS=(); PENDING_JS_MODES=()
+  local app f mode rc changed
+  for app in "${AUTO_APPS[@]}"; do
+    [ -d "$app" ] || { err "Приложение исчезло: $app"; return 1; }
+    changed=0
+    local app_binaries=()
+    for f in "$app/Contents/Resources/bin/language_server" \
+      "$app"/Contents/Resources/app/extensions/antigravity/bin/language_server*; do
+      [ -f "$f" ] && app_binaries+=("$f")
+    done
+    [ ${#app_binaries[@]} -gt 0 ] || { err "Language Server не найден: $app"; return 1; }
+    for f in "${app_binaries[@]}"; do
+      check_binary "$f"; rc=$?
+      case "$rc" in
+        0) ;;
+        10) PENDING_BINARIES+=("$f"); changed=1 ;;
+        *) return 1 ;;
+      esac
+    done
+    f="$app/Contents/Resources/app/out/main.js"
+    if [ -f "$f" ]; then
+      for mode in main ext; do
+        if [ "$mode" = ext ]; then
+          f="$app/Contents/Resources/app/extensions/antigravity/dist/extension.js"
+          [ -f "$f" ] || continue
+        fi
+        check_js "$mode" "$f"; rc=$?
+        case "$rc" in
+          0) ;;
+          10) PENDING_JS+=("$f"); PENDING_JS_MODES+=("$mode"); changed=1 ;;
+          *) err "Не удалось проверить JS-патч: $f"; return 1 ;;
+        esac
+      done
+    fi
+    codesign --verify --deep "$app" 2>/dev/null || changed=1
+    [ "$changed" -eq 1 ] && PENDING_APPS+=("$app")
+  done
+  check_binary "$AUTO_CLI"; rc=$?
+  case "$rc" in
+    0) ;;
+    10) PENDING_BINARIES+=("$AUTO_CLI") ;;
+    *) return 1 ;;
+  esac
+  [ ${#PENDING_BINARIES[@]} -eq 0 ] && [ ${#PENDING_APPS[@]} -eq 0 ] && return 0
+  return 10
+}
+
+auto_require_idle() {
+  local processes pid executable app
+  processes=$(ps -axo pid=,comm=) || { err "Не удалось проверить активные процессы"; return 1; }
+  while read -r pid executable; do
+    [ "$pid" = "$$" ] && continue
+    if [ "$executable" = "$AUTO_CLI" ]; then
+      err "Закрой активную сессию agy (PID $pid) и повтори команду."; return 1
+    fi
+    for app in "${AUTO_APPS[@]}"; do
+      case "$executable" in
+        "$app"/*) err "Закрой Antigravity (PID $pid) и повтори команду."; return 1 ;;
+      esac
+    done
+  done <<< "$processes"
+  return 0
+}
+
+auto_ensure() {
+  local rc f index mode
+  auto_check; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 10 ] || return "$rc"
+  auto_require_idle || return 1
+  if [ "$(id -u)" -ne 0 ] && [ -z "$AG_NO_ELEVATE" ]; then
+    local args=(--ensure-patched --cli-path "$AUTO_CLI")
+    for f in "${AUTO_APPS[@]}"; do args+=(--app "$f"); done
+    sudo bash "$0" "${args[@]}"
+    return $?
+  fi
+  local lock="/private/tmp/ag-unlocker-${SUDO_UID:-$(id -u)}.lock"
+  (umask 077; mkdir "$lock") 2>/dev/null || {
+    err "Патч уже выполняется или осталась блокировка $lock. Повтори после завершения."; return 1;
+  }
+  AUTO_LOCK="$lock"
+  # Another invocation may have completed while sudo was asking for a password.
+  auto_check; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 10 ] || return "$rc"
+  auto_require_idle || return 1
+  for ((index=0; index<${#PENDING_JS[@]}; index++)); do
+    f="${PENDING_JS[$index]}"; mode="${PENDING_JS_MODES[$index]}"
+    # The interactive patcher only warns on backup failure; automation must stop.
+    if [ ! -e "$f.ag_backup" ]; then
+      cp -p "$f" "$f.ag_backup" || { err "Не удалось создать бэкап: $f"; return 1; }
+    fi
+    ensure_helper || return 1
+    perl "$HELPER" "$mode" "$f" || { err "Не удалось применить JS-патч: $f"; return 1; }
+    if command -v node >/dev/null 2>&1 && ! node --check "$f"; then
+      perl "$HELPER" revert "$f"
+      err "JS-патч не парсится: $f"; return 1
+    fi
+  done
+  for f in "${PENDING_BINARIES[@]}"; do
+    if LC_ALL=C grep -q 'ineligible' "$f"; then
+      perl -0777 -pi -e 's/ineligible/inexigible/g' "$f" || { err "Не удалось записать: $f"; return 1; }
+    fi
+    codesign --force --sign - "$f" || { err "Не удалось подписать: $f"; return 1; }
+  done
+  for f in "${PENDING_APPS[@]}"; do
+    xattr -dr com.apple.quarantine "$f" 2>/dev/null
+    codesign --force --deep --sign - "$f" || { err "Не удалось подписать: $f"; return 1; }
+  done
+  auto_check; rc=$?
+  [ "$rc" -eq 0 ] || { err "Проверка после патча не прошла"; return 1; }
+  ok "Патч проверен. Запускаю agy."
+}
+
 # ---------------------------------------------------------------- menu / main
 [ "$1" = "--watch" ] && { watch_loop; exit 0; }
 
-trap '[ -n "$HELPER" ] && rm -f "$HELPER" 2>/dev/null' EXIT
+AUTO_LOCK=""
+cleanup() {
+  [ -n "$HELPER" ] && rm -f "$HELPER" 2>/dev/null
+  [ -n "$AUTO_LOCK" ] && rmdir "$AUTO_LOCK" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -n "$AUTO_MODE" ]; then
+  exec 1>&2
+  if [ "$AUTO_MODE" = --check ]; then auto_check; else auto_ensure; fi
+  exit $?
+fi
 
 find_apps || true
 if [ ${#APPS[@]} -gt 0 ]; then
